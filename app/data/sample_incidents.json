@@ -1,0 +1,82 @@
+[
+  {
+    "title": "Database latency spike — orders service P99 > 8s in production",
+    "description": "Starting at 14:32 UTC, P99 query latency for the orders-service PostgreSQL cluster exceeded 8 seconds. Checkout conversion dropped 40%. CloudWatch shows RDS CPU at 94% and active connections at max pool size (500). No recent schema migrations. Autovacuum was disabled last week during a bulk import that was never re-enabled. Error logs show 'connection timeout' and 'too many clients'.",
+    "source": "manual",
+    "service_name": "orders-service",
+    "environment": "production",
+    "raw_severity": "P1"
+  },
+  {
+    "title": "Auth service returning 503 — login failures across all regions",
+    "description": "Authentication service is returning HTTP 503 for ~85% of login attempts since 09:15 UTC. Affects web, mobile, and API clients. Internal health endpoint returns 200 but external load balancer shows 'no healthy upstream'. Kubernetes liveness probe logs show pods cycling between Running and CrashLoopBackOff. Last deployment was 2 hours ago (version 3.4.1). Redis session cache is healthy.",
+    "source": "manual",
+    "service_name": "auth-api",
+    "environment": "production",
+    "raw_severity": "critical"
+  },
+  {
+    "title": "Payment gateway timeouts — Stripe webhook processing delayed 45 minutes",
+    "description": "Payment confirmation webhooks from Stripe are not being processed. Queue depth on the payment-processor SQS queue has grown from 0 to 14,000 messages in the last 90 minutes. Lambda consumer function is timing out at 15s (max). Stripe dashboard shows successful webhook delivery attempts but our endpoint is returning 504. No Lambda errors in CloudWatch — function appears to not be invoking. Suspect EventSourceMapping disabled.",
+    "source": "manual",
+    "service_name": "payment-gateway",
+    "environment": "production",
+    "raw_severity": "SEV-1"
+  },
+  {
+    "title": "Kubernetes pod restart storm — product catalog service in crash loop",
+    "description": "product-catalog-service pods in the us-east-1 cluster are in CrashLoopBackOff. Restart count exceeds 50 in the last 30 minutes. kubectl logs show: 'FATAL: unable to connect to config service at config-service:8080 — connection refused'. config-service was scaled to 0 replicas by an automated cost-saving job at 03:00 UTC. Product catalog is down. Search, homepage, and PDP pages are affected.",
+    "source": "json",
+    "service_name": "product-catalog",
+    "environment": "production",
+    "raw_severity": "high"
+  },
+  {
+    "title": "Memory spike — recommendation engine OOMKilled, ML model not loading",
+    "description": "recommendation-engine pods are being OOMKilled approximately every 8 minutes. Memory limit is 4Gi; heap dump shows 3.8Gi consumed during model loading. The team shipped a new XGBoost model yesterday (v2.1.0) that is 2.4x larger than v2.0.0. No memory limit adjustment was made. Recommendations are falling back to popularity-based ranking. Affects 100% of users on homepage and PDP.",
+    "source": "manual",
+    "service_name": "recommendation-engine",
+    "environment": "production",
+    "raw_severity": "high"
+  },
+  {
+    "title": "Disk pressure on logging nodes — Elasticsearch ingest blocked",
+    "description": "Three Elasticsearch data nodes in the logging cluster are showing disk usage above 90% (watermark threshold). Elasticsearch has automatically set all indices to read-only. Log ingestion pipeline (Filebeat → Logstash → ES) is backing up — Logstash pipeline has 2.1M events queued. Application logs from the last 4 hours are not searchable. No disk cleanup policy was configured after we expanded log retention from 7 to 30 days last month.",
+    "source": "csv",
+    "service_name": "logging-infrastructure",
+    "environment": "production",
+    "raw_severity": "medium"
+  },
+  {
+    "title": "DNS resolution failures — intermittent service-to-service communication errors",
+    "description": "Intermittent DNS resolution failures observed across microservices in the staging cluster since 11:00 UTC. Services report 'dial tcp: lookup service-name on 10.96.0.10:53: no such host' approximately 5% of the time. CoreDNS pods are healthy and logs show high query rates. Suspect DNS cache exhaustion or CoreDNS pod CPU throttling. No changes to CoreDNS config. Cluster recently scaled from 20 to 45 nodes.",
+    "source": "manual",
+    "service_name": "core-dns",
+    "environment": "staging",
+    "raw_severity": "medium"
+  },
+  {
+    "title": "SQS queue backlog — notification service processing delayed by 3 hours",
+    "description": "The customer notification SQS queue has a backlog of 280,000 messages. Messages include order confirmation emails, SMS shipping alerts, and push notifications. Consumer Lambda is processing at 200 msg/min vs normal 2,000 msg/min. Investigation shows Lambda concurrency limit was reduced from 500 to 50 last night by an engineer who was debugging a different function. Customers are complaining about not receiving order confirmations.",
+    "source": "manual",
+    "service_name": "notification-service",
+    "environment": "production",
+    "raw_severity": "P2"
+  },
+  {
+    "title": "API gateway rate limit misconfiguration — legitimate traffic blocked",
+    "description": "Starting at 16:00 UTC following a WAF rule update, approximately 30% of API requests from enterprise customers are receiving HTTP 429 responses. The new rate limit policy applied global IP-based throttling without accounting for enterprise customers who route through shared corporate NAT IPs. 12 enterprise accounts have escalated. Revenue impact estimated at $45,000/hour. Rollback of WAF rules requires change approval.",
+    "source": "manual",
+    "service_name": "api-gateway",
+    "environment": "production",
+    "raw_severity": "P1"
+  },
+  {
+    "title": "SSL certificate expiry — internal service mesh mTLS handshake failures",
+    "description": "Internal service mesh (Istio) mTLS handshake failures started at 02:00 UTC. Error: 'certificate has expired or is not yet valid'. The intermediate CA certificate used for internal service identity expired. cert-manager was configured to renew 30 days before expiry but the renewal job failed silently 35 days ago (Slack alert routing was broken). Affected: 8 internal microservices that use strict mTLS peer authentication.",
+    "source": "json",
+    "service_name": "service-mesh",
+    "environment": "production",
+    "raw_severity": "critical"
+  }
+]

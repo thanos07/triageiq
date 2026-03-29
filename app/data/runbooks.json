@@ -1,0 +1,253 @@
+[
+  {
+    "id": "rb-001",
+    "name": "Database High Latency / Connection Exhaustion",
+    "category": "database",
+    "keywords": ["database", "latency", "postgres", "mysql", "connection", "pool", "timeout", "slow query", "autovacuum", "rds", "cpu"],
+    "severity_applicability": ["critical", "high"],
+    "actions": [
+      "Check active connections: SELECT count(*) FROM pg_stat_activity WHERE state = 'active';",
+      "Identify long-running queries: SELECT pid, now() - pg_stat_activity.query_start AS duration, query FROM pg_stat_activity WHERE state != 'idle' ORDER BY duration DESC LIMIT 20;",
+      "Kill blocking queries if necessary: SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE duration > interval '5 minutes' AND state = 'active';",
+      "Check autovacuum status: SELECT schemaname, relname, last_autovacuum, last_autoanalyze FROM pg_stat_user_tables ORDER BY last_autovacuum DESC;",
+      "Review connection pool settings and reduce max_connections if pool exhausted.",
+      "Enable autovacuum if disabled: ALTER SYSTEM SET autovacuum = 'on'; SELECT pg_reload_conf();",
+      "Consider scaling RDS instance vertically if CPU is sustained above 80%.",
+      "Enable slow query log and identify the top 5 slowest queries for optimization.",
+      "Escalate to DBA if query plan changes or index corruption suspected."
+    ],
+    "escalation_triggers": ["OOMKilled", "data corruption", "replication lag > 60s", "disk full"],
+    "caution": "Do not terminate backend connections in bulk without understanding active transactions — you may cause partial writes."
+  },
+  {
+    "id": "rb-002",
+    "name": "Service CrashLoopBackOff / Pod Restart Storm",
+    "category": "kubernetes",
+    "keywords": ["crashloopbackoff", "pod", "restart", "kubernetes", "k8s", "crash loop", "container", "oomkill", "liveness probe"],
+    "severity_applicability": ["critical", "high"],
+    "actions": [
+      "Check pod status: kubectl get pods -n <namespace> | grep -E 'CrashLoop|Error|OOMKilled'",
+      "Read recent logs: kubectl logs <pod-name> -n <namespace> --previous --tail=100",
+      "Describe the pod for events: kubectl describe pod <pod-name> -n <namespace>",
+      "Check resource limits and current usage: kubectl top pods -n <namespace>",
+      "Identify the exit code in pod status — OOMKilled = 137, config error = 1, segfault = 139.",
+      "If OOMKilled: increase memory limit in the deployment spec (kubectl edit deployment <name>).",
+      "If dependency not found: verify all ConfigMaps, Secrets, and dependent services are running.",
+      "Roll back to the previous stable deployment: kubectl rollout undo deployment/<name> -n <namespace>",
+      "Verify rollback succeeded: kubectl rollout status deployment/<name> -n <namespace>",
+      "After stabilization, review resource requests and limits to prevent recurrence."
+    ],
+    "escalation_triggers": ["all replicas crashing", "rollback fails", "cluster-wide instability"],
+    "caution": "Avoid force-deleting pods repeatedly — focus on root cause. Repeated pod cycling degrades etcd."
+  },
+  {
+    "id": "rb-003",
+    "name": "Authentication Service Failure / 503 Errors",
+    "category": "authentication",
+    "keywords": ["auth", "authentication", "login", "503", "unauthorized", "token", "session", "oauth", "jwt", "redis"],
+    "severity_applicability": ["critical", "high"],
+    "actions": [
+      "Check auth service health endpoint directly (bypass load balancer): curl -s http://<pod-ip>:<port>/health",
+      "Verify load balancer target group health in your cloud console.",
+      "Check upstream dependencies: Redis, database, and any identity provider (OIDC, LDAP).",
+      "Review recent deployments: kubectl rollout history deployment/auth-api",
+      "Check for configuration drift — compare current ConfigMap to last known good state.",
+      "If pods are in CrashLoopBackOff: follow rb-002 (Kubernetes CrashLoop runbook).",
+      "If Redis session cache is suspect: verify connectivity with redis-cli PING.",
+      "Temporarily enable debug logging: kubectl set env deployment/auth-api LOG_LEVEL=DEBUG",
+      "If upstream identity provider is down: engage their support and communicate ETA to stakeholders.",
+      "Roll back deployment if failure started after a recent release."
+    ],
+    "escalation_triggers": ["identity provider outage", "token signing key compromised", "security incident suspected"],
+    "caution": "Do not disable authentication as a temporary workaround — escalate instead."
+  },
+  {
+    "id": "rb-004",
+    "name": "Payment / Webhook Processing Backlog",
+    "category": "payments",
+    "keywords": ["payment", "webhook", "stripe", "sqs", "queue", "lambda", "timeout", "backlog", "billing", "transaction"],
+    "severity_applicability": ["critical", "high"],
+    "actions": [
+      "Check queue depth and age of oldest message in SQS / RabbitMQ / Kafka.",
+      "Verify the consumer Lambda/service is running and not throttled.",
+      "Check Lambda concurrency limits: aws lambda get-function-concurrency --function-name <name>",
+      "Verify the EventSourceMapping is enabled: aws lambda list-event-source-mappings --function-name <name>",
+      "Re-enable if disabled: aws lambda update-event-source-mapping --uuid <uuid> --enabled",
+      "Increase Lambda concurrency limit if messages are processing slowly.",
+      "Monitor the queue drain rate — estimate time to clear at current throughput.",
+      "Check for poison-pill messages causing consumer failures (DLQ depth).",
+      "Move failed messages from DLQ back to main queue after fixing the consumer.",
+      "Notify finance/customer teams of delay — do not silently drop messages.",
+      "Verify with payment provider that webhooks are not being retried excessively."
+    ],
+    "escalation_triggers": ["duplicate payment charges", "financial data loss", "PCI compliance concern"],
+    "caution": "Never delete messages from a payment queue without confirming their state. Financial data loss is irreversible."
+  },
+  {
+    "id": "rb-005",
+    "name": "Memory Pressure / OOMKilled Containers",
+    "category": "infrastructure",
+    "keywords": ["memory", "oom", "oomkilled", "heap", "leak", "ram", "out of memory", "limit", "gc"],
+    "severity_applicability": ["high", "medium"],
+    "actions": [
+      "Confirm OOMKill: kubectl describe pod <name> and look for 'OOMKilled' in last state.",
+      "Check current memory usage vs limit: kubectl top pods -n <namespace>",
+      "Review recent changes: was a new version deployed? Was a larger model or dataset loaded?",
+      "Capture a heap dump if the container supports it (e.g., jmap for JVM, py-spy for Python).",
+      "Increase memory limit temporarily to restore service: kubectl edit deployment <name>",
+      "Set a proper memory request equal to ~70-80% of the limit to aid scheduler placement.",
+      "Check for memory leaks: review gc logs, object counts, or profiler output.",
+      "If caused by a model upgrade: coordinate with the ML team to optimize model size or quantize.",
+      "Add horizontal scaling if vertical scaling is not sufficient.",
+      "Set up memory usage alerts at 75% and 90% thresholds going forward."
+    ],
+    "escalation_triggers": ["entire namespace OOMKilled", "node pressure eviction", "data loss risk"],
+    "caution": "Increasing limits is a mitigation, not a fix. Always follow up with memory profiling."
+  },
+  {
+    "id": "rb-006",
+    "name": "Disk Pressure / Storage Full",
+    "category": "infrastructure",
+    "keywords": ["disk", "storage", "full", "capacity", "disk pressure", "elasticsearch", "logs", "volume", "pvc", "watermark"],
+    "severity_applicability": ["high", "medium"],
+    "actions": [
+      "Identify which volume is full: df -h (on node or container).",
+      "Find the largest consumers: du -sh /* | sort -rh | head -20",
+      "Check log rotation policy — is log rotation running and working?",
+      "For Elasticsearch: clear read-only mode after freeing space: PUT /_all/_settings {\"index.blocks.write\": null}",
+      "Delete old log indices in Elasticsearch: identify indices older than retention policy.",
+      "Increase Elasticsearch disk watermark thresholds temporarily if safe: cluster.routing.allocation.disk.watermark.*",
+      "Expand the persistent volume if possible (cloud provider volume resize).",
+      "Set up ILM (Index Lifecycle Management) policy in Elasticsearch.",
+      "Review and reduce log retention to match the original policy.",
+      "Add disk usage alert at 75% threshold going forward."
+    ],
+    "escalation_triggers": ["production database storage full", "data loss imminent", "filesystem corruption"],
+    "caution": "Do not blindly delete files — confirm what each directory contains before removing."
+  },
+  {
+    "id": "rb-007",
+    "name": "DNS Resolution Failures in Kubernetes",
+    "category": "network",
+    "keywords": ["dns", "coredns", "resolution", "lookup", "hostname", "service discovery", "network", "dial tcp"],
+    "severity_applicability": ["high", "medium"],
+    "actions": [
+      "Verify CoreDNS pods are running: kubectl get pods -n kube-system -l k8s-app=kube-dns",
+      "Check CoreDNS logs: kubectl logs -n kube-system -l k8s-app=kube-dns --tail=100",
+      "Test DNS from a pod: kubectl run dns-test --image=busybox --rm -it -- nslookup kubernetes.default",
+      "Check CoreDNS CPU and memory — throttling causes intermittent failures.",
+      "If CPU throttled: increase CoreDNS resource limits in the CoreDNS deployment.",
+      "Scale CoreDNS replicas to match cluster size (rule of thumb: 1 replica per 8 nodes).",
+      "Check node-level DNS settings: /etc/resolv.conf on affected nodes.",
+      "Enable CoreDNS caching plugin if not already enabled (reduces upstream query load).",
+      "Review ndots setting in pod DNS config — high ndots causes excessive search-domain queries.",
+      "Restart CoreDNS pods if state is corrupted: kubectl rollout restart deployment/coredns -n kube-system"
+    ],
+    "escalation_triggers": ["cluster-wide DNS failure", "external DNS provider outage", "network partition"],
+    "caution": "CoreDNS restart causes a brief DNS blackout — do it during low-traffic window if possible."
+  },
+  {
+    "id": "rb-008",
+    "name": "Message Queue Backlog / Consumer Lag",
+    "category": "messaging",
+    "keywords": ["queue", "sqs", "kafka", "rabbitmq", "backlog", "consumer", "lag", "message", "notification", "concurrency"],
+    "severity_applicability": ["high", "medium"],
+    "actions": [
+      "Measure current queue depth and consumer throughput.",
+      "Identify why consumers are slow: check Lambda timeout, concurrency limits, or consumer errors.",
+      "Check DLQ (Dead Letter Queue) depth for failed messages.",
+      "Temporarily increase consumer concurrency or scale consumer fleet horizontally.",
+      "For Lambda: raise reserved concurrency limit and monitor throttle metrics.",
+      "For Kafka: add consumer group members or increase partition count.",
+      "Fix any consumer errors causing retries (check consumer logs for exception patterns).",
+      "Estimate time-to-drain at current throughput and communicate to stakeholders.",
+      "After draining: tune prefetch count, batch size, and visibility timeout.",
+      "Implement backpressure handling to prevent future backlogs."
+    ],
+    "escalation_triggers": ["message expiry / TTL loss", "consumer cannot keep up long-term", "ordering guarantees broken"],
+    "caution": "Increasing concurrency aggressively can overwhelm downstream services — scale incrementally."
+  },
+  {
+    "id": "rb-009",
+    "name": "Rate Limit / WAF Misconfiguration",
+    "category": "api-gateway",
+    "keywords": ["rate limit", "429", "throttle", "waf", "api gateway", "blocked", "firewall", "ip", "nat"],
+    "severity_applicability": ["high", "medium"],
+    "actions": [
+      "Confirm which clients / IPs are being blocked by reviewing gateway access logs.",
+      "Check if the new rule affects shared NAT IPs (common for enterprise/B2B customers).",
+      "Identify the specific WAF rule or rate limit policy that was recently changed.",
+      "If safe to do so: temporarily disable the offending rule or raise the rate limit.",
+      "Add affected enterprise customer IPs / IP ranges to an allowlist.",
+      "Initiate a change approval request for rollback if immediate rollback is not permitted.",
+      "Communicate status to affected enterprise accounts with an ETA.",
+      "After fix: implement rate limit policies per-customer-token, not per-IP.",
+      "Add integration tests for rate limit policies before future WAF changes.",
+      "Review change management process to prevent unreviewed WAF rule deployments."
+    ],
+    "escalation_triggers": ["revenue impact exceeds $10k/hour", "SLA breach imminent", "security rules compromised"],
+    "caution": "Do not disable security WAF rules broadly — target only the misconfigured rule. Get security team sign-off."
+  },
+  {
+    "id": "rb-010",
+    "name": "SSL / TLS Certificate Expiry",
+    "category": "security",
+    "keywords": ["ssl", "tls", "certificate", "cert", "expired", "mtls", "x509", "handshake", "istio", "cert-manager"],
+    "severity_applicability": ["critical", "high"],
+    "actions": [
+      "Confirm certificate expiry: echo | openssl s_client -connect <host>:<port> 2>/dev/null | openssl x509 -noout -dates",
+      "Identify which certificate is expired (external, internal CA, intermediate, leaf).",
+      "For cert-manager: check CertificateRequest and Order status: kubectl get certificaterequests -A",
+      "Check cert-manager logs for renewal errors: kubectl logs -n cert-manager -l app=cert-manager",
+      "Manually trigger renewal: kubectl delete secret <tls-secret-name> -n <namespace> (cert-manager will recreate).",
+      "For Istio internal CA: check istiod certificate: istioctl proxy-config secret <pod>",
+      "Rotate the intermediate CA if it has expired — follow your PKI runbook.",
+      "Restart affected pods after certificate renewal to pick up new cert from secret.",
+      "Fix the alerting pipeline that missed the renewal failure notification.",
+      "Set monitoring alerts for certificates expiring within 30, 14, and 7 days."
+    ],
+    "escalation_triggers": ["external customer-facing certificate expired", "CA compromise suspected", "cannot renew without downtime"],
+    "caution": "Certificate rotation requires careful sequencing — rotating the CA before updating trust anchors causes cascading failures."
+  },
+  {
+    "id": "rb-011",
+    "name": "Service Dependency Unavailable",
+    "category": "infrastructure",
+    "keywords": ["dependency", "connection refused", "upstream", "config service", "service unavailable", "scaled to zero", "microservice"],
+    "severity_applicability": ["high", "medium"],
+    "actions": [
+      "Identify the exact dependency that is unavailable from error logs.",
+      "Check if the upstream service is running: kubectl get pods -n <namespace> -l app=<service>",
+      "Check if the service was accidentally scaled to zero: kubectl get deployment <name> -n <namespace>",
+      "Scale it back up if needed: kubectl scale deployment <name> --replicas=<n> -n <namespace>",
+      "Verify network connectivity from dependent service: kubectl exec -it <pod> -- curl <service-url>/health",
+      "Check if a scheduled job, autoscaler, or cost-saving script caused the scale-down.",
+      "Review service mesh policies — mTLS or network policies may be blocking traffic.",
+      "After restoring the dependency, verify downstream services recover automatically.",
+      "Add dependency health checks to your deployment readiness probes.",
+      "Audit scheduled jobs that modify replica counts."
+    ],
+    "escalation_triggers": ["cascading failure across multiple services", "data inconsistency from partial operations"],
+    "caution": "Before scaling up, confirm the service was not intentionally taken down for maintenance."
+  },
+  {
+    "id": "rb-012",
+    "name": "General Escalation / Unknown Incident",
+    "category": "general",
+    "keywords": ["unknown", "escalate", "unclear", "undetermined", "general"],
+    "severity_applicability": ["critical", "high", "medium", "low"],
+    "actions": [
+      "Gather all available information: error messages, logs, metrics, and recent changes.",
+      "Identify the blast radius — which users and services are affected.",
+      "Check for recent deployments, configuration changes, or infrastructure changes in the last 24 hours.",
+      "Engage the on-call engineer for the most affected service.",
+      "Open a war-room channel and invite relevant stakeholders.",
+      "Set up a bridge call if the incident is customer-facing and severity is high.",
+      "Document findings in real time in the incident channel.",
+      "Establish a communication cadence — update stakeholders every 15–30 minutes.",
+      "Declare a post-mortem and capture timeline after the incident is resolved."
+    ],
+    "escalation_triggers": ["any customer-facing impact > 15 minutes", "data loss risk", "security breach suspected"],
+    "caution": "Do not attempt destructive remediation steps without a second engineer reviewing them."
+  }
+]

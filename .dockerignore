@@ -1,0 +1,46 @@
+# Environment — never bake secrets into the image
+.env
+.env.*
+
+# Python artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Database — use the volume instead
+data/
+*.db
+*.db-wal
+*.db-shm
+
+# Tests and dev tools
+tests/
+pytest.ini
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Git
+.git/
+.gitignore
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docs (not needed at runtime)
+*.md
