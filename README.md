@@ -60,8 +60,6 @@ pytest tests/ -v   # 156 tests, no API key required
 
 **Plain Python over LangGraph** — linear fixed pipeline; LangGraph adds complexity without benefit here.
 
-**Provider abstraction** — swap Anthropic for OpenAI by writing one new file.
-
 **Confidence bounding** — scores clamped to [0.10, 0.95]; evidence-weak causes cap at 0.50.
 
 **Fallback safety** — every agent catches its own errors; pipeline continues as partial_failure.
