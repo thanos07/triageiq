@@ -23,7 +23,7 @@ Submit incident → 4-agent triage pipeline → structured result + audit trail 
 | Backend API | FastAPI + Uvicorn |
 | Frontend | Streamlit |
 | Database | SQLite via SQLAlchemy |
-| LLM | Anthropic Claude (claude-3-5-haiku) |
+| LLM | Groq-llama-3.3-70b |
 | Retry | Tenacity (exponential backoff) |
 | Tests | Pytest — 156 tests, zero API calls |
 | Packaging | Docker + Docker Compose |
