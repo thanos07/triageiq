@@ -3,14 +3,16 @@ app/db/database.py
 
 Database engine setup and session management.
 
-We use SQLAlchemy with a SQLite backend. SQLite is chosen for the MVP because:
-  - Zero infrastructure (no separate database server to run)
-  - File-based (easy to inspect, backup, reset)
-  - Sufficient for single-user portfolio demos
-  - Can be swapped for Postgres later by changing DATABASE_URL in .env
+Supports both SQLite (local dev, default) and PostgreSQL (production deployments
+on Streamlit Cloud / Neon / Supabase / RDS). Dialect is auto-detected from the
+DATABASE_URL — no other code needs to change to swap backends.
 
-For a production system you would replace SQLite with PostgreSQL and add
-connection pooling. This file is the only place that would need to change.
+  - sqlite:///./data/triage.db        →  SQLite, file-based (local dev)
+  - postgresql://user:pw@host/db      →  Postgres (Neon, Supabase, RDS, etc.)
+
+For production deployments, point DATABASE_URL at a managed Postgres instance
+via Streamlit secrets or environment variables. Everything else — models, CRUD,
+agents, pipeline — works unchanged.
 """
 
 import os
@@ -22,10 +24,23 @@ from app.utils.logger import get_logger
 logger = get_logger(__name__)
 
 
-# ── Ensure the data directory exists ──────────────────────────────────────────
-# SQLite needs the parent directory to exist before it can create the .db file
+# ── Detect dialect once, up front ─────────────────────────────────────────────
+_DB_URL = settings.database_url
+IS_SQLITE = _DB_URL.startswith("sqlite")
+IS_POSTGRES = _DB_URL.startswith("postgresql") or _DB_URL.startswith("postgres")
+
+# Neon's connection string starts with "postgres://" but SQLAlchemy 2.x only
+# accepts "postgresql://". Normalize so users can paste either form.
+if _DB_URL.startswith("postgres://"):
+    _DB_URL = _DB_URL.replace("postgres://", "postgresql://", 1)
+
+
+# ── Ensure the data directory exists (SQLite only) ────────────────────────────
 def _ensure_data_dir() -> None:
-    db_path = settings.database_url.replace("sqlite:///", "")
+    """SQLite needs the parent directory to exist before it can create the .db file."""
+    if not IS_SQLITE:
+        return
+    db_path = _DB_URL.replace("sqlite:///", "")
     data_dir = os.path.dirname(db_path)
     if data_dir and not os.path.exists(data_dir):
         os.makedirs(data_dir, exist_ok=True)
@@ -35,23 +50,37 @@ def _ensure_data_dir() -> None:
 _ensure_data_dir()
 
 
-# ── Engine ────────────────────────────────────────────────────────────────────
-# connect_args={"check_same_thread": False} is required for SQLite when
-# multiple threads share the same connection (FastAPI uses a thread pool).
-engine = create_engine(
-    settings.database_url,
-    connect_args={"check_same_thread": False},
-    echo=settings.is_development,  # Log SQL in dev; silence in prod
-)
+# ── Engine (dialect-aware kwargs) ─────────────────────────────────────────────
+if IS_SQLITE:
+    # check_same_thread=False lets SQLAlchemy share connections across threads
+    # (Streamlit + background pipeline thread).
+    engine_kwargs = {
+        "connect_args": {"check_same_thread": False},
+        "echo": settings.is_development,
+    }
+elif IS_POSTGRES:
+    # pool_pre_ping handles connections dropped by Neon's idle-timeout autosuspend.
+    # pool_recycle forces a fresh connection every 5 min to stay ahead of timeouts.
+    engine_kwargs = {
+        "pool_pre_ping": True,
+        "pool_recycle": 300,
+        "echo": False,  # Postgres echo is noisy; off even in dev
+    }
+else:
+    engine_kwargs = {"echo": settings.is_development}
+
+engine = create_engine(_DB_URL, **engine_kwargs)
 
 
-# Enable WAL mode for SQLite — better concurrent read performance
-@event.listens_for(engine, "connect")
-def set_sqlite_pragma(dbapi_connection, connection_record):
-    cursor = dbapi_connection.cursor()
-    cursor.execute("PRAGMA journal_mode=WAL")
-    cursor.execute("PRAGMA foreign_keys=ON")
-    cursor.close()
+# ── SQLite-specific PRAGMA setup ──────────────────────────────────────────────
+if IS_SQLITE:
+    @event.listens_for(engine, "connect")
+    def _set_sqlite_pragma(dbapi_connection, connection_record):
+        """Enable WAL journal mode and foreign-key enforcement on every SQLite connection."""
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
 
 
 # ── Session factory ───────────────────────────────────────────────────────────
