@@ -43,6 +43,15 @@ from app.services.ingestion import (
 from app.config import settings
 
 
+# ── Page setup (MUST be the first Streamlit call) ─────────────────────────────
+st.set_page_config(
+    page_title="Incident Triage Copilot",
+    page_icon="🔺",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+
 # ── One-time DB initialization (runs once per Streamlit process) ──────────────
 @st.cache_resource
 def _bootstrap() -> bool:
@@ -57,14 +66,6 @@ _bootstrap()
 # ── Config ─────────────────────────────────────────────────────────────────────
 POLL_INTERVAL_S = 1.5
 POLL_MAX_ATTEMPTS = 40
-
-# ── Page setup ─────────────────────────────────────────────────────────────────
-st.set_page_config(
-    page_title="Incident Triage Copilot",
-    page_icon="🔺",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
 
 # ── Global CSS ─────────────────────────────────────────────────────────────────
 st.markdown("""
