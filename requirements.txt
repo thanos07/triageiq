@@ -12,3 +12,4 @@ python-dotenv==1.0.1
 python-multipart==0.0.9
 tenacity==9.0.0
 python-dateutil==2.9.0
+psycopg2-binary==2.9.10
