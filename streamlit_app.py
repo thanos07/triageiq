@@ -16,12 +16,45 @@ Run with:
 
 import time
 import json
-import requests
+import threading
+import uuid
+from urllib.parse import urlparse, parse_qs
+
 import streamlit as st
 from datetime import datetime
 
+# ── In-process service layer (no FastAPI required) ────────────────────────────
+# This file used to call FastAPI over HTTP. It now imports the app modules
+# directly. The original `api(method, path, ...)` helper is preserved as an
+# in-process router so the UI code below is untouched.
+from app.db.database import SessionLocal, init_db, check_db_connection
+from app.db import crud
+from app.orchestration.pipeline import IncidentPipeline, PipelineError
+from app.schemas.incident import (
+    IncidentInput,
+    IncidentResponse,
+)
+from app.services.normalizer import normalize_incident
+from app.services.ingestion import (
+    parse_csv_upload,
+    parse_json_upload,
+    load_sample_incidents,
+)
+from app.config import settings
+
+
+# ── One-time DB initialization (runs once per Streamlit process) ──────────────
+@st.cache_resource
+def _bootstrap() -> bool:
+    """Create tables on first run. cache_resource ensures this only runs once."""
+    init_db()
+    return True
+
+
+_bootstrap()
+
+
 # ── Config ─────────────────────────────────────────────────────────────────────
-API_BASE = "http://localhost:8000/api/v1"
 POLL_INTERVAL_S = 1.5
 POLL_MAX_ATTEMPTS = 40
 
@@ -243,28 +276,392 @@ section[data-testid="stSidebar"] .stSelectbox label { color: #8890a4 !important;
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# API helpers
+# In-process router — replaces the previous HTTP `api()` helper.
+#
+# The UI code below still calls `api("get", "/incidents")` exactly as before.
+# Instead of hitting FastAPI over HTTP, this dispatches to the same service
+# functions that the FastAPI routes call. Each call gets its own short-lived
+# SQLAlchemy session so behavior matches the FastAPI request lifecycle.
+#
+# Pipeline runs happen in a background thread so the UI's existing polling
+# loops continue to work without modification.
 # ══════════════════════════════════════════════════════════════════════════════
 
-def api(method: str, path: str, **kwargs):
-    """Thin wrapper around requests — returns (data_or_None, error_or_None)."""
+def _session():
+    """Yield a short-lived DB session. Mirrors FastAPI's get_db dependency."""
+    db = SessionLocal()
     try:
-        r = getattr(requests, method)(f"{API_BASE}{path}", timeout=90, **kwargs)
-        if r.status_code in (200, 201):
-            return r.json(), None
-        return None, f"API error {r.status_code}: {r.text[:200]}"
-    except requests.exceptions.ConnectionError:
-        return None, "Cannot connect to API. Is `uvicorn main:app` running on port 8000?"
-    except Exception as e:
+        return db
+    except Exception:
+        db.close()
+        raise
+
+
+def _orm_to_dict(obj) -> dict:
+    """Serialize a SQLAlchemy Incident row into the dict shape the UI expects."""
+    return IncidentResponse.model_validate(obj).model_dump(mode="json")
+
+
+def _run_pipeline_async(incident_id: str) -> None:
+    """Fire-and-forget pipeline runner (mirrors FastAPI BackgroundTasks)."""
+    def worker():
+        db = SessionLocal()
+        try:
+            IncidentPipeline(db).run(incident_id)
+        except PipelineError as e:
+            try:
+                crud.update_incident_status(db, incident_id, "failed")
+            except Exception:
+                pass
+        except Exception:
+            try:
+                crud.update_incident_status(db, incident_id, "failed")
+            except Exception:
+                pass
+        finally:
+            db.close()
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+# ── Route handlers (each opens its own session) ───────────────────────────────
+
+def _submit_incident(body: dict) -> dict:
+    payload = IncidentInput(**body)
+    incident_id = str(uuid.uuid4())
+    normalized = normalize_incident(payload, incident_id=incident_id)
+    db = _session()
+    try:
+        crud.create_incident(db, {
+            "id": incident_id, "title": normalized.title,
+            "description": normalized.description, "source": normalized.source,
+            "service_name": normalized.service_name, "environment": normalized.environment,
+            "raw_severity": normalized.raw_severity, "submitted_at": normalized.submitted_at,
+            "raw_input": payload.model_dump(), "workflow_status": "pending",
+        })
+        crud.create_workflow_result(db, incident_id)
+    finally:
+        db.close()
+    return {"incident_id": incident_id, "workflow_status": "pending",
+            "message": "Incident submitted."}
+
+
+def _list_incidents(limit: int = 20, offset: int = 0) -> dict:
+    db = _session()
+    try:
+        rows = crud.list_incidents(db, limit=limit, offset=offset)
+        return {"total": len(rows), "incidents": [_orm_to_dict(r) for r in rows]}
+    finally:
+        db.close()
+
+
+def _get_incident(incident_id: str) -> dict:
+    db = _session()
+    try:
+        incident = crud.get_incident(db, incident_id)
+        if not incident:
+            raise LookupError(f"Incident not found: {incident_id}")
+        return _orm_to_dict(incident)
+    finally:
+        db.close()
+
+
+def _bulk_persist(normalized_incidents, source_tag: str,
+                  parse_errors: list[str]) -> dict:
+    """Shared helper for CSV / JSON / sample uploads."""
+    incident_ids, db_errors = [], []
+    db = _session()
+    try:
+        for n in normalized_incidents:
+            try:
+                crud.create_incident(db, {
+                    "id": n.incident_id, "title": n.title, "description": n.description,
+                    "source": n.source, "service_name": n.service_name,
+                    "environment": n.environment, "raw_severity": n.raw_severity,
+                    "submitted_at": n.submitted_at,
+                    "raw_input": {"source": source_tag},
+                    "workflow_status": "pending",
+                })
+                crud.create_workflow_result(db, n.incident_id)
+                incident_ids.append(n.incident_id)
+            except Exception as e:
+                db_errors.append(f"DB error for '{n.title[:40]}': {e}")
+    finally:
+        db.close()
+    return {
+        "submitted": len(incident_ids),
+        "failed": len(parse_errors) + len(db_errors),
+        "incident_ids": incident_ids,
+        "errors": parse_errors + db_errors,
+    }
+
+
+def _upload_csv(file_bytes: bytes) -> dict:
+    if not file_bytes:
+        raise ValueError("File is empty")
+    normalized, parse_errors = parse_csv_upload(file_bytes)
+    return _bulk_persist(normalized, "csv_upload", parse_errors)
+
+
+def _upload_json(file_bytes: bytes) -> dict:
+    if not file_bytes:
+        raise ValueError("File is empty")
+    normalized, parse_errors = parse_json_upload(file_bytes)
+    return _bulk_persist(normalized, "json_upload", parse_errors)
+
+
+def _load_samples() -> dict:
+    normalized = load_sample_incidents()
+    if not normalized:
+        raise RuntimeError("Failed to load sample incidents")
+    db = _session()
+    try:
+        existing_titles = {i.title for i in crud.list_incidents(db, limit=200)}
+    finally:
+        db.close()
+    fresh = [n for n in normalized if n.title not in existing_titles]
+    skipped = [f"Skipped (exists): {n.title[:60]}"
+               for n in normalized if n.title in existing_titles]
+    return _bulk_persist(fresh, "sample_data", skipped)
+
+
+def _trigger_workflow(incident_id: str) -> dict:
+    db = _session()
+    try:
+        incident = crud.get_incident(db, incident_id)
+        if not incident:
+            raise LookupError(f"Incident not found: {incident_id}")
+        if incident.workflow_status == "running":
+            raise RuntimeError("Pipeline is already running for this incident")
+        crud.update_incident_status(db, incident_id, "running")
+    finally:
+        db.close()
+    _run_pipeline_async(incident_id)
+    return {"incident_id": incident_id, "status": "running",
+            "message": "Triage pipeline started."}
+
+
+def _get_workflow_result(incident_id: str) -> dict:
+    db = _session()
+    try:
+        result = crud.get_workflow_result(db, incident_id)
+        if not result:
+            raise LookupError(
+                f"No workflow result found for incident: {incident_id}")
+        events = crud.list_audit_events(db, incident_id)
+        audit_trail = [{
+            "stage": e.stage, "status": e.status, "confidence": e.confidence,
+            "latency_ms": e.latency_ms, "retry_count": e.retry_count,
+            "llm_model": e.llm_model, "error_message": e.error_message,
+            "timestamp": e.timestamp.isoformat() if e.timestamp else None,
+        } for e in events]
+        incident = crud.get_incident(db, incident_id)
+        pipeline_status = incident.workflow_status if incident else "unknown"
+        overall_conf = result.overall_confidence or 0.0
+        low_flag = (overall_conf < settings.low_confidence_threshold
+                    and overall_conf > 0)
+        return {
+            "incident_id": incident_id,
+            "pipeline_status": pipeline_status,
+            "overall_confidence": overall_conf,
+            "low_confidence_flag": low_flag,
+            "processing_time_s": result.processing_time_s,
+            "review_status": result.review_status or "awaiting_human_review",
+            "severity_output": result.severity_output,
+            "root_cause_output": result.root_cause_output,
+            "runbook_output": result.runbook_output,
+            "summary_output": result.summary_output,
+            "audit_trail": audit_trail,
+        }
+    finally:
+        db.close()
+
+
+def _get_workflow_state(incident_id: str) -> dict:
+    db = _session()
+    try:
+        incident = crud.get_incident(db, incident_id)
+        if not incident:
+            raise LookupError(f"Incident not found: {incident_id}")
+        result = crud.get_workflow_result(db, incident_id)
+        return {
+            "incident_id": incident_id,
+            "workflow_status": incident.workflow_status,
+            "review_status": (result.review_status if result
+                              else "awaiting_human_review"),
+            "overall_confidence": (result.overall_confidence if result else None),
+        }
+    finally:
+        db.close()
+
+
+def _get_audit_trail(incident_id: str) -> dict:
+    db = _session()
+    try:
+        incident = crud.get_incident(db, incident_id)
+        if not incident:
+            raise LookupError(f"Incident not found: {incident_id}")
+        events = crud.list_audit_events(db, incident_id)
+        serialized = [{
+            "id": e.id, "incident_id": e.incident_id, "stage": e.stage,
+            "status": e.status, "confidence": e.confidence,
+            "latency_ms": e.latency_ms, "retry_count": e.retry_count,
+            "llm_model": e.llm_model, "error_message": e.error_message,
+            "payload_summary": e.payload_summary,
+            "timestamp": e.timestamp.isoformat() if e.timestamp else None,
+        } for e in events]
+        return {"incident_id": incident_id, "events": serialized,
+                "total": len(serialized)}
+    finally:
+        db.close()
+
+
+def _get_audit_summary(incident_id: str) -> dict:
+    db = _session()
+    try:
+        events = crud.list_audit_events(db, incident_id)
+        if not events:
+            return {"incident_id": incident_id, "stages": [],
+                    "total_latency_ms": 0}
+        stages = [{
+            "stage": e.stage, "status": e.status,
+            "confidence": round(e.confidence, 3) if e.confidence else None,
+            "latency_ms": e.latency_ms, "retry_count": e.retry_count,
+            "has_error": bool(e.error_message),
+        } for e in events]
+        total_latency = sum(e.latency_ms for e in events
+                            if e.latency_ms is not None)
+        failed = [s for s in stages if s["status"] in ("failed", "fallback")]
+        return {
+            "incident_id": incident_id, "stages": stages,
+            "total_latency_ms": total_latency,
+            "failed_stage_count": len(failed),
+            "all_succeeded": len(failed) == 0,
+        }
+    finally:
+        db.close()
+
+
+def _submit_review(incident_id: str, body: dict) -> dict:
+    decision = body.get("decision")
+    if decision not in ("approved", "rejected"):
+        raise ValueError(
+            f"Invalid decision '{decision}'. Must be 'approved' or 'rejected'.")
+    db = _session()
+    try:
+        incident = crud.get_incident(db, incident_id)
+        if not incident:
+            raise LookupError(f"Incident not found: {incident_id}")
+        result = crud.get_workflow_result(db, incident_id)
+        if not result or incident.workflow_status in ("pending", "running"):
+            raise RuntimeError(
+                "Cannot review an incident that has not completed triage.")
+        review = crud.create_review_decision(
+            db, incident_id=incident_id, decision=decision,
+            reviewer_note=body.get("reviewer_note"),
+        )
+        return {
+            "incident_id": incident_id, "decision": review.decision,
+            "reviewer_note": review.reviewer_note,
+            "decided_at": (review.decided_at.isoformat()
+                           if review.decided_at else None),
+            "message": f"Incident {decision}. Review recorded.",
+        }
+    finally:
+        db.close()
+
+
+def _get_review(incident_id: str) -> dict:
+    db = _session()
+    try:
+        review = crud.get_latest_review(db, incident_id)
+        if not review:
+            raise LookupError(
+                f"No review decision found for incident: {incident_id}")
+        return {
+            "incident_id": incident_id, "decision": review.decision,
+            "reviewer_note": review.reviewer_note,
+            "decided_at": (review.decided_at.isoformat()
+                           if review.decided_at else None),
+            "message": f"Latest decision: {review.decision}",
+        }
+    finally:
+        db.close()
+
+
+# ── Dispatcher (the new `api()` ) ─────────────────────────────────────────────
+
+def api(method: str, path: str, **kwargs):
+    """
+    In-process router. Same signature and (data, error) return shape as the
+    old HTTP helper, so all call sites in the UI below work unchanged.
+
+    Supported kwargs:
+        json={...}                            — body payload
+        files={"file": (name, bytes, mime)}   — file upload
+    """
+    method = method.lower()
+    # Strip query string and use it as kwargs for list endpoints
+    parsed = urlparse(path)
+    raw_path = parsed.path
+    qs = {k: v[0] for k, v in parse_qs(parsed.query).items()}
+
+    body = kwargs.get("json")
+    files = kwargs.get("files")
+    parts = [p for p in raw_path.strip("/").split("/") if p]
+
+    try:
+        # ── Incidents ──────────────────────────────────────────────────────
+        if method == "get" and parts == ["incidents"]:
+            return _list_incidents(int(qs.get("limit", 20)),
+                                   int(qs.get("offset", 0))), None
+        if method == "get" and len(parts) == 2 and parts[0] == "incidents":
+            return _get_incident(parts[1]), None
+        if method == "post" and parts == ["incidents"]:
+            return _submit_incident(body or {}), None
+        if method == "post" and parts == ["incidents", "upload", "csv"]:
+            return _upload_csv(files["file"][1]), None
+        if method == "post" and parts == ["incidents", "upload", "json"]:
+            return _upload_json(files["file"][1]), None
+        if method == "post" and parts == ["incidents", "load-samples"]:
+            return _load_samples(), None
+
+        # ── Workflow ───────────────────────────────────────────────────────
+        if (method == "post" and len(parts) == 3
+                and parts[0] == "workflow" and parts[2] == "run"):
+            return _trigger_workflow(parts[1]), None
+        if (method == "get" and len(parts) == 3
+                and parts[0] == "workflow" and parts[2] == "state"):
+            return _get_workflow_state(parts[1]), None
+        if method == "get" and len(parts) == 2 and parts[0] == "workflow":
+            return _get_workflow_result(parts[1]), None
+
+        # ── Audit ──────────────────────────────────────────────────────────
+        if (method == "get" and len(parts) == 3
+                and parts[0] == "audit" and parts[2] == "summary"):
+            return _get_audit_summary(parts[1]), None
+        if method == "get" and len(parts) == 2 and parts[0] == "audit":
+            return _get_audit_trail(parts[1]), None
+
+        # ── Review ─────────────────────────────────────────────────────────
+        if method == "post" and len(parts) == 2 and parts[0] == "review":
+            return _submit_review(parts[1], body or {}), None
+        if method == "get" and len(parts) == 2 and parts[0] == "review":
+            return _get_review(parts[1]), None
+
+        return None, f"Unknown route: {method.upper()} {raw_path}"
+
+    except LookupError as e:
         return None, str(e)
+    except (ValueError, RuntimeError) as e:
+        return None, str(e)
+    except Exception as e:
+        return None, f"{type(e).__name__}: {e}"
 
 
 def check_api() -> bool:
-    try:
-        r = requests.get("http://localhost:8000/health", timeout=3)
-        return r.status_code == 200
-    except Exception:
-        return False
+    """Compatibility shim — checks DB instead of HTTP API."""
+    return check_db_connection()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -352,14 +749,23 @@ with st.sidebar:
 
     st.markdown("<hr style='border-color:#1a1c2a;margin:1rem 0'>", unsafe_allow_html=True)
 
-    # API status indicator
-    api_ok = check_api()
-    dot = "🟢" if api_ok else "🔴"
-    msg = "API connected" if api_ok else "API offline"
-    st.markdown(f"<div style='font-size:0.75rem;color:#4a5270'>{dot} {msg}</div>", unsafe_allow_html=True)
+    # Backend status indicator (DB + LLM provider)
+    db_ok = check_db_connection()
+    has_llm_key = bool(settings.groq_api_key or settings.anthropic_api_key)
+    provider = ("Groq" if settings.groq_api_key
+                else "Anthropic" if settings.anthropic_api_key
+                else "None")
 
-    if not api_ok:
-        st.caption("Run: `uvicorn main:app --reload`")
+    db_dot = "🟢" if db_ok else "🔴"
+    llm_dot = "🟢" if has_llm_key else "🟠"
+    st.markdown(
+        f"<div style='font-size:0.75rem;color:#4a5270'>"
+        f"{db_dot} DB &nbsp;·&nbsp; {llm_dot} LLM ({provider})"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+    if not has_llm_key:
+        st.caption("Set GROQ_API_KEY or ANTHROPIC_API_KEY in secrets")
 
     st.markdown("<br>", unsafe_allow_html=True)
     if st.button("⟳  Load sample data", use_container_width=True):
